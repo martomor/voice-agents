@@ -1,0 +1,27 @@
+[project]
+name = "langchain-assembly-11labs-pipeline"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "langchain>=1.0.0",
+    "langchain-anthropic>=1.2.0",
+    "langchain-core>=1.0.0",
+    "langgraph>=1.0.4",
+    "python-dotenv",
+    "websockets",
+    "fastapi>=0.111.0",
+    "uvicorn[standard]>=0.29.0",
+    "python-multipart>=0.0.9",
+    "pydantic>=2.0.0",
+]
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
