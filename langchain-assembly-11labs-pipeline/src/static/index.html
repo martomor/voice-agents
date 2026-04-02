@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Austin Trip Voice Agent</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #0f172a;
+      color: #e2e8f0;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 2rem 1rem;
+    }
+    h1 { font-size: 1.5rem; font-weight: 700; margin-bottom: 0.25rem; }
+    .subtitle { color: #94a3b8; font-size: 0.875rem; margin-bottom: 1.5rem; }
+    #controls { margin-bottom: 1.5rem; }
+    button {
+      padding: 0.6rem 1.6rem;
+      border-radius: 8px;
+      border: none;
+      cursor: pointer;
+      font-size: 0.95rem;
+      font-weight: 600;
+      transition: background 0.15s;
+    }
+    #startBtn { background: #22c55e; color: #fff; }
+    #startBtn:hover { background: #16a34a; }
+    #startBtn.active { background: #ef4444; }
+    #startBtn.active:hover { background: #dc2626; }
+    #status {
+      font-size: 0.8rem;
+      color: #64748b;
+      margin-top: 0.5rem;
+      text-align: center;
+      min-height: 1.2em;
+    }
+    #chat {
+      width: 100%;
+      max-width: 720px;
+      display: flex;
+      flex-direction: column;
+      gap: 1rem;
+    }
+    .turn { display: flex; flex-direction: column; gap: 0.4rem; }
+    .bubble {
+      padding: 0.6rem 1rem;
+      border-radius: 10px;
+      line-height: 1.5;
+      max-width: 90%;
+      word-break: break-word;
+    }
+    .user-bubble { background: #1e3a5f; align-self: flex-end; color: #bfdbfe; }
+    .agent-bubble { background: #1e3a2f; align-self: flex-start; color: #bbf7d0; }
+    .label { font-size: 0.7rem; color: #475569; }
+    .label.user { text-align: right; }
+    #live {
+      width: 100%;
+      max-width: 720px;
+      display: flex;
+      flex-direction: column;
+      gap: 0.4rem;
+    }
+    .live-bubble {
+      padding: 0.6rem 1rem;
+      border-radius: 10px;
+      font-style: italic;
+      color: #94a3b8;
+      background: #1e293b;
+      max-width: 90%;
+    }
+    .live-bubble.user { align-self: flex-end; }
+    .live-bubble.agent { align-self: flex-start; }
+  </style>
+</head>
+<body>
+  <h1>Austin Trip Voice Agent</h1>
+  <p class="subtitle">Ask me anything about the Austin trip schedule for May 2025.</p>
+
+  <div id="controls">
+    <button id="startBtn" onclick="toggleMic()">Start</button>
+    <div id="status">Click Start to begin</div>
+  </div>
+
+  <div id="live">
+    <div id="liveUser" class="live-bubble user" style="display:none"></div>
+    <div id="liveAgent" class="live-bubble agent" style="display:none"></div>
+  </div>
+
+  <div id="chat"></div>
+
+  <script>
+    // ── State ────────────────────────────────────────────────────────────────────
+    let ws = null;
+    let audioCtx = null;
+    let micStream = null;
+    let workletNode = null;
+    let isRunning = false;
+
+    // TTS playback scheduling
+    let nextPlayTime = 0;
+    let activeSources = [];
+    let ttsBlocked = false;  // true after interrupt, until next agent response
+
+    // In-progress turn buffers
+    let curTranscript = "";
+    let curResponse = "";
+
+    // ── DOM refs ─────────────────────────────────────────────────────────────────
+    const startBtn = document.getElementById("startBtn");
+    const statusEl = document.getElementById("status");
+    const chatEl = document.getElementById("chat");
+    const liveUserEl = document.getElementById("liveUser");
+    const liveAgentEl = document.getElementById("liveAgent");
+
+    function setStatus(msg) { statusEl.textContent = msg; }
+
+    // ── AudioWorklet processor source (loaded as Blob URL) ───────────────────────
+    const WORKLET_SRC = `
+class PCMProcessor extends AudioWorkletProcessor {
+  process(inputs) {
+    const input = inputs[0][0];
+    if (!input || input.length === 0) return true;
+    const ratio = sampleRate / 16000;
+    const outLen = Math.floor(input.length / ratio);
+    const out = new Int16Array(outLen);
+    for (let i = 0; i < outLen; i++) {
+      const s = input[Math.floor(i * ratio)];
+      out[i] = Math.max(-32768, Math.min(32767, s * 32768));
+    }
+    this.port.postMessage(out.buffer, [out.buffer]);
+    return true;
+  }
+}
+registerProcessor('pcm-processor', PCMProcessor);
+`;
+
+    // ── TTS playback ─────────────────────────────────────────────────────────────
+    function stopTTS() {
+      if (activeSources.length > 0) {
+        console.log(`[interrupt] stopping ${activeSources.length} active TTS source(s)`);
+      }
+      ttsBlocked = true;
+      for (const src of activeSources) {
+        try { src.stop(); } catch (e) {}
+      }
+      activeSources = [];
+      nextPlayTime = 0;
+    }
+
+    function playPCM(base64str) {
+      if (!audioCtx || ttsBlocked) return;
+      const binary = atob(base64str);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+
+      const samples = new Int16Array(bytes.buffer);
+      const floats = new Float32Array(samples.length);
+      for (let i = 0; i < samples.length; i++) floats[i] = samples[i] / 32768;
+
+      const buf = audioCtx.createBuffer(1, floats.length, 24000);
+      buf.copyToChannel(floats, 0);
+
+      const src = audioCtx.createBufferSource();
+      src.buffer = buf;
+      src.connect(audioCtx.destination);
+      activeSources.push(src);
+      src.onended = () => { activeSources = activeSources.filter(s => s !== src); };
+
+      const now = audioCtx.currentTime;
+      const startAt = Math.max(now, nextPlayTime);
+      src.start(startAt);
+      nextPlayTime = startAt + buf.duration;
+    }
+
+    // ── WebSocket event handling ──────────────────────────────────────────────────
+    function handleEvent(ev) {
+      switch (ev.type) {
+        case "stt_chunk":
+          console.log(`[stt_chunk] "${ev.transcript}" — ttsBlocked was ${ttsBlocked}`);
+          stopTTS();
+          curTranscript = ev.transcript;
+          liveUserEl.textContent = "You: " + curTranscript;
+          liveUserEl.style.display = "block";
+          break;
+
+        case "stt_output":
+          curTranscript = ev.transcript;
+          liveUserEl.textContent = "You: " + curTranscript;
+          liveUserEl.style.display = "block";
+          break;
+
+        case "agent_chunk":
+          ttsBlocked = false;  // new response starting — allow TTS again
+          curResponse += ev.text;
+          liveAgentEl.textContent = "Agent: " + curResponse;
+          liveAgentEl.style.display = "block";
+          break;
+
+        case "agent_end":
+          commitTurn();
+          break;
+
+        case "tts_chunk":
+          if (ttsBlocked) console.log("[tts_chunk] blocked (interrupted)");
+          playPCM(ev.audio);
+          break;
+
+        case "tool_call":
+          setStatus(`Tool called: ${ev.name}`);
+          break;
+      }
+    }
+
+    function commitTurn() {
+      if (!curTranscript && !curResponse) return;
+
+      const turn = document.createElement("div");
+      turn.className = "turn";
+
+      if (curTranscript) {
+        const userLabel = document.createElement("div");
+        userLabel.className = "label user";
+        userLabel.textContent = "You";
+        const userBubble = document.createElement("div");
+        userBubble.className = "bubble user-bubble";
+        userBubble.textContent = curTranscript;
+        turn.appendChild(userLabel);
+        turn.appendChild(userBubble);
+      }
+
+      if (curResponse) {
+        const agentLabel = document.createElement("div");
+        agentLabel.className = "label";
+        agentLabel.textContent = "Agent";
+        const agentBubble = document.createElement("div");
+        agentBubble.className = "bubble agent-bubble";
+        agentBubble.textContent = curResponse;
+        turn.appendChild(agentLabel);
+        turn.appendChild(agentBubble);
+      }
+
+      chatEl.insertBefore(turn, chatEl.firstChild);
+
+      // Clear live
+      curTranscript = "";
+      curResponse = "";
+      liveUserEl.style.display = "none";
+      liveAgentEl.style.display = "none";
+      liveUserEl.textContent = "";
+      liveAgentEl.textContent = "";
+
+      setStatus("Listening — speak now");
+    }
+
+    // ── Mic + WebSocket start/stop ────────────────────────────────────────────────
+    async function toggleMic() {
+      if (isRunning) {
+        stopSession();
+      } else {
+        await startSession();
+      }
+    }
+
+    async function startSession() {
+      try {
+        setStatus("Requesting microphone...");
+        micStream = await navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+          video: false,
+        });
+
+        audioCtx = new AudioContext();
+        nextPlayTime = 0;
+
+        // Load AudioWorklet
+        const blob = new Blob([WORKLET_SRC], { type: "application/javascript" });
+        const blobURL = URL.createObjectURL(blob);
+        await audioCtx.audioWorklet.addModule(blobURL);
+        URL.revokeObjectURL(blobURL);
+
+        const source = audioCtx.createMediaStreamSource(micStream);
+        workletNode = new AudioWorkletNode(audioCtx, "pcm-processor");
+
+        // Open WebSocket
+        const proto = location.protocol === "https:" ? "wss" : "ws";
+        ws = new WebSocket(`${proto}://${location.host}/ws`);
+        ws.binaryType = "arraybuffer";
+
+        ws.onopen = () => {
+          setStatus("Connected — listening");
+          // Wire worklet → WebSocket after connection is open
+          workletNode.port.onmessage = (e) => {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+              ws.send(e.data);
+            }
+          };
+          source.connect(workletNode);
+          workletNode.connect(audioCtx.destination); // needed to keep worklet alive in some browsers
+        };
+
+        ws.onmessage = (e) => {
+          try {
+            handleEvent(JSON.parse(e.data));
+          } catch (err) {
+            console.error("Failed to parse event:", err);
+          }
+        };
+
+        ws.onerror = (e) => { setStatus("WebSocket error"); console.error(e); };
+        ws.onclose = () => {
+          if (isRunning) setStatus("Connection closed");
+        };
+
+        isRunning = true;
+        startBtn.textContent = "Stop";
+        startBtn.classList.add("active");
+
+      } catch (err) {
+        setStatus(`Error: ${err.message}`);
+        console.error(err);
+      }
+    }
+
+    function stopSession() {
+      isRunning = false;
+      startBtn.textContent = "Start";
+      startBtn.classList.remove("active");
+
+      stopTTS();
+      if (workletNode) { workletNode.disconnect(); workletNode = null; }
+      if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+      if (ws) { ws.close(); ws = null; }
+      if (audioCtx) { audioCtx.close(); audioCtx = null; }
+      setStatus("Stopped. Click Start to begin again.");
+    }
+  </script>
+</body>
+</html>

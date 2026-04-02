@@ -205,3 +205,9 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Project-specific
+.playwright-mcp/
+*.m4a
+*.png
+langchain-assembly-11labs-pipeline/.env

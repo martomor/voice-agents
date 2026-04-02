@@ -1,0 +1,11 @@
+services:
+  voice-agent:
+    build: .
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    volumes:
+      - ./src:/app/src        # hot-reload during development
+      - ./docs:/app/docs
+      - "../Voice Agents Demo.m4a:/app/input.m4a"
